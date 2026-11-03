@@ -1,0 +1,227 @@
+
+name: win 11 + tailscale + Download.bat script
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Check Windows and Available RAM
+        shell: pwsh
+        run: |
+          Write-Host "===== WINDOWS INFORMATION ====="
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsArchitecture
+
+          Write-Host "===== CPU INFORMATION ====="
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+          Write-Host "===== RAM INFORMATION ====="
+          $computer = Get-CimInstance Win32_ComputerSystem
+          ramGB=[math]::Round(computer.TotalPhysicalMemory / 1GB, 2)
+
+          Write-Host "Available RAM: $ramGB GB"
+          Write-Host "Requested RAM: 16 GB"
+
+          if ($ramGB -ge 16) {
+            Write-Host "16 GB RAM requirement satisfied."
+          }
+          else {
+            Write-Warning "Runner has less than 16 GB RAM."
+            Write-Host "Actual available RAM: $ramGB GB"
+          }
+
+          Write-Host "===== STORAGE ====="
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name,
+              @{Name="FreeGB";Expression={[math]::Round($_.Free / 1GB, 2)}}
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop and preserve original settings
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove existing firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # Original firewall configuration
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        shell: pwsh
+        run: |
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          else {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+          Write-Host "RDP user created successfully."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          installerPath="env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Tailscale installation failed."
+          }
+
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        run: |
+          # Connect Tailscale with original authentication key
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTHKEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale connection failed."
+              exit 1
+          }
+
+          # Wait for Tailscale IP
+          $tsIP = $null
+          $retries = 0
+
+          while (-not $tsIP -and $retries -lt 10) {
+              tsIP=(&"env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select-Object -First 1).Trim()
+
+              if (-not $tsIP) {
+                  Start-Sleep -Seconds 5
+              }
+
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          Start-Sleep -Seconds 10
+
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection + Watch RDP User
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "RAM Target: 16 GB"
+          Write-Host "Timeout: 360 minutes"
+          Write-Host "==================`n"
+
+          $rdpProfile = "C:\Users\RDP"
+          startupPath="rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          downloadPath="startupPath\Downloads.bat"
+
+          # Wait for RDP profile
+          while ($true) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+
+                      Invoke-WebRequest `
+                        -Uri $downloadUrl `
+                        -OutFile $downloadPath `
+                        -UseBasicParsing
+
+                      Write-Host "Downloads.bat copied to $downloadPath"
+
+                      # Run batch file for the first time
+                      cmd /c $downloadPath
+
+                      Write-Host "Downloads.bat executed successfully"
+                      break
+                  }
+                  catch {
+                      Write-Host "Error copying or executing Downloads.bat: (_.Exception.Message)"
+                      throw
+                  }
+              }
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+          # Keep runner alive
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+
+              # Check Tailscale
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status | Out-Null
+
+              # Monitor RAM
+              $computer = Get-CimInstance Win32_ComputerSystem
+              ramGB=[math]::Round(computer.TotalPhysicalMemory / 1GB, 2)
+
+              Write-Host "Available RAM: $ramGB GB"
+              Write-Host "RAM Target: 16 GB"
+
+              Start-Sleep -Seconds 300
+          }
+
+
